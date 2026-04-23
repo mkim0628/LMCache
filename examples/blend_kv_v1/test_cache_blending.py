@@ -1,176 +1,224 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-CacheBlend benchmark: accuracy, latency, and KV-cache hit ratio.
+CacheBlend benchmark: accuracy · latency · KV-cache hit ratio
 
-Scenario
---------
-Phase 1 – KV-Cache Pre-computation (store)
-    Send Doc A, Doc B, and Doc C through the model in their natural order.
-    LMCache stores per-chunk KV tensors for each document.
+Follows the same token-building pattern as blend.py (Mistral [INST] tokens,
+tokenizer.encode(text)[1:] to strip BOS, llm.generate with prompt_token_ids).
 
-Phase 2 – CacheBlend evaluation (reordered)
-    Submit a query whose document order differs from Phase 1 (Doc B first, then
-    Doc A).  LMCache detects the chunk-level reuse and blends the cached KVs
-    instead of recomputing them from scratch.
+Documents
+---------
+Doc A  Sarah Kim profile:  12 yrs exp · QuickIndex inventor · joined TechNova
+       in 2019 · manages 8 engineers · speaks Korean & English.
+Doc B  Project Falcon:     real-time analytics at TechNova · technical lead is
+       Sarah Kim · uses QuickIndex for compression · phase 2 of 3 · $8 M budget.
+Doc C  Sourdough baking:   unrelated distractor.
 
-Cross-attention accuracy design
-    Doc A  – Alice Chen invented the AlphaCache algorithm.
-    Doc B  – Project Athena's technical lead is Dr. Alice Chen; AlphaCache was
-             cited as the key reason for her selection.
-    Doc C  – Unrelated maritime-history filler (distractor).
+5 cross-attention accuracy queries
+-----------------------------------
+Every query requires combining information from BOTH Doc A and Doc B.
+Neither document alone is sufficient to produce a correct answer.
 
-    Neither document alone can answer:
-        "What algorithm was invented by the technical lead of Project Athena,
-         and what type of system did it revolutionize?"
-    Correct answer: AlphaCache / distributed key-value storage
-    (requires cross-document reasoning between Doc A and Doc B)
+  Q1  How many years of experience does Project Falcon's technical lead have?
+      Doc B → lead = Sarah Kim   Doc A → 12 years
 
-Metrics
--------
-* Accuracy     – whether the generated answer contains the expected keywords
-* Latency      – wall-clock generation time per query (seconds)
-* KV hit ratio – fraction of input tokens served from cache
-                 (computed from per-document chunk counts)
+  Q2  Who invented the compression algorithm used in Project Falcon?
+      Doc B → QuickIndex used   Doc A → Sarah Kim invented QuickIndex
+
+  Q3  What year did Project Falcon's technical lead join TechNova?
+      Doc B → lead = Sarah Kim   Doc A → joined 2019
+
+  Q4  How many engineers does Project Falcon's technical lead manage?
+      Doc B → lead = Sarah Kim   Doc A → team of 8
+
+  Q5  What languages does Project Falcon's technical lead speak?
+      Doc B → lead = Sarah Kim   Doc A → Korean and English
+
+Flow
+----
+1. Warmup — short dummy request to initialise the engine
+2. Store  — run (Doc A → Doc B → Doc C) to populate LMCache with chunk KVs
+3. Blend  — run (Doc B → Doc A) for each of the 5 queries; LMCache blends
+            the cached KV tensors instead of recomputing from scratch
+4. Print summary: accuracy · latency · TTFT · KV-cache hit ratio
 
 Usage
 -----
-    python test_cache_blending.py [--model MODEL] [--use-disk] [--max-tokens N]
+    python test_cache_blending.py
+    python test_cache_blending.py --model meta-llama/Llama-3-8B-Instruct
+    python test_cache_blending.py --use-disk
 """
 
+# Standard
+from dataclasses import asdict, dataclass
 import argparse
 import contextlib
 import os
 import time
-from dataclasses import asdict, dataclass
 
+# Third Party
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
+# First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
 
 # ---------------------------------------------------------------------------
-# Document content
-# Each document is written to exceed 256 tokens (= default chunk_size) so
-# that at least one complete chunk is stored in LMCache per document.
+# Mistral [INST] / [/INST] token IDs
+# ---------------------------------------------------------------------------
+INST_OPEN = [1, 733, 16289, 28793]      # <s>[INST]
+INST_CLOSE = [733, 28748, 16289, 28793]  # [/INST]
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# Each document is written to exceed 256 tokens (default chunk_size) so that
+# at least one full chunk is stored in LMCache per document.
 # ---------------------------------------------------------------------------
 
+# ~270 tokens: personal profile, all facts needed for cross-attention answers
 DOC_A = (
-    "Alice Chen is a distinguished professor of computer science at the Metropolitan "
-    "University of Technology. She holds a PhD from Stanford University in distributed "
-    "systems and artificial intelligence. Her research focuses on federated learning "
-    "and privacy-preserving computation. She joined Metropolitan University in 2015 "
-    "after spending eight years at Google Research, where she led the distributed "
-    "systems team. Professor Chen has published over 150 peer-reviewed papers in top "
-    "venues including SOSP, OSDI, NSDI, and NeurIPS. She is the inventor of the "
-    "AlphaCache algorithm, which revolutionized distributed key-value storage. Her "
-    "laboratory is known as the Systems and Intelligence Research Group (SIRG). The "
-    "SIRG has received over $10 million in funding from NSF, DARPA, and industry "
-    "partners. Alice is also the author of the widely-used textbook 'Modern "
-    "Distributed Systems: Principles and Practice,' which has been adopted by over "
-    "200 universities worldwide. She serves as the program chair of USENIX ATC and "
-    "is on the editorial board of ACM TOCS. Professor Chen's most recent breakthrough "
-    "involves applying transformer architectures to optimize consensus protocols in "
-    "Byzantine fault-tolerant systems. Her PhD advisee Marcus Webb recently won the "
-    "Best Paper Award at OSDI for work on cache-coherent memory systems. Professor "
-    "Chen is widely regarded as one of the foremost experts in large-scale storage "
-    "architecture and has consulted for major technology companies and government "
-    "agencies. Her AlphaCache system has been deployed in production environments "
-    "handling billions of requests per day across globally distributed infrastructure."
+    "Sarah Kim is a software engineer with twelve years of professional experience "
+    "in backend infrastructure and distributed storage systems. She specializes in "
+    "database optimization, query performance tuning, and lossless compression "
+    "algorithms for large-scale columnar data pipelines. Sarah is the inventor of "
+    "the QuickIndex compression algorithm, a technique that reduces storage overhead "
+    "by forty percent in columnar database workloads through a novel block-level "
+    "index-encoding scheme. She earned a master's degree in computer science from "
+    "Seoul National University in 2012, graduating with highest honors. Before "
+    "joining TechNova Inc in 2019 as a senior software engineer, she spent five "
+    "years at DataSphere Corp building and maintaining large-scale indexing pipelines "
+    "that processed terabytes of structured data daily across distributed clusters. "
+    "At TechNova, Sarah was promoted to engineering team lead in 2021 and currently "
+    "manages a team of eight engineers focused on storage and retrieval systems. "
+    "She is fluent in both Korean and English, having grown up in Seoul and "
+    "developed her international career working across North America and Asia. "
+    "Sarah holds two patents related to the QuickIndex algorithm and has published "
+    "three peer-reviewed papers on database compression. Her QuickIndex system has "
+    "been deployed in production at several Fortune 500 companies handling billions "
+    "of records per day. Colleagues consistently describe her as methodical, "
+    "technically rigorous, and an effective mentor to junior engineers."
 )
 
+# ~270 tokens: project description, links Sarah Kim via her role and QuickIndex
 DOC_B = (
-    "Project Athena is a landmark initiative launched in 2023 by the Federal "
-    "Department of Advanced Research and Technology. The project aims to build the "
-    "next generation of exascale computing infrastructure for national security and "
-    "scientific applications. Project Athena has a budget of $500 million spread "
-    "over five years, with the primary objective of achieving 2 exaflop sustained "
-    "performance on real-world workloads. The technical lead for Project Athena is "
-    "Dr. Alice Chen, whose pioneering work on the AlphaCache algorithm was cited as "
-    "the key reason for her selection to lead this critical national program. The "
-    "project involves three major components: the Hercules compute cluster, the "
-    "Prometheus storage fabric, and the Minerva interconnect. The Hercules cluster "
-    "consists of 16,384 nodes each equipped with 8 NVIDIA H100 GPUs and 2 TB of "
-    "NVMe storage. The Prometheus storage fabric provides 100 petabytes of "
-    "high-performance storage with sub-millisecond latency. The Minerva interconnect "
-    "uses a next-generation optical switching fabric with 800 Gbps per port. Project "
-    "Athena is currently in Phase 2 of 4, with hardware procurement completed and "
-    "software stack integration underway. The project is expected to be fully "
-    "operational by Q3 2025 and will be hosted at three geographically distributed "
-    "data centers: Denver, Colorado; Raleigh, North Carolina; and Portland, Oregon. "
-    "Partner institutions include MIT, Carnegie Mellon University, and the National "
-    "Renewable Energy Laboratory. The project is considered a cornerstone of the "
-    "national computing strategy for the next decade."
+    "Project Falcon is a real-time analytics platform under active development at "
+    "TechNova Inc. The project was initiated in January 2020 with a total approved "
+    "budget of eight million dollars and a target public launch in the third quarter "
+    "of next year. The primary engineering goal of Project Falcon is to enable "
+    "enterprise clients to ingest, process, and visualize high-velocity streaming "
+    "data with end-to-end latency consistently below fifty milliseconds. The "
+    "technical lead of Project Falcon is Sarah Kim, who was selected for the role "
+    "specifically because of her deep expertise in storage optimization and her "
+    "invention of the QuickIndex compression algorithm, which forms the core of "
+    "Project Falcon's internal data compression layer. The project is structured "
+    "into three sequential phases: infrastructure provisioning, core engine "
+    "development, and client-facing API integration. The team is currently working "
+    "through phase two of three. Project Falcon targets customers in the financial "
+    "services and healthcare sectors, where low-latency data visibility is critical. "
+    "The platform is architected to scale horizontally and sustain up to one million "
+    "ingest events per second under peak load. TechNova plans to open-source the "
+    "compression module once the platform reaches general availability, as the module "
+    "is built entirely on top of the QuickIndex algorithm. The project has received "
+    "strong internal executive sponsorship and is considered a flagship initiative "
+    "for TechNova's enterprise data division."
 )
 
+# ~270 tokens: unrelated distractor, contains no names, algorithms, or dates
+# that could be confused with Doc A or Doc B facts
 DOC_C = (
-    "The history of maritime exploration has shaped the modern world in profound "
-    "ways. From the Phoenician traders who navigated the Mediterranean Sea three "
-    "thousand years ago to the great Age of Discovery in the fifteenth and sixteenth "
-    "centuries, seafaring civilizations have driven economic and cultural exchange "
-    "across continents. The Portuguese explorer Vasco da Gama opened the sea route "
-    "to India in 1498, fundamentally transforming trade between Europe and Asia. "
-    "Christopher Columbus, sailing under the Spanish flag in 1492, initiated "
-    "sustained contact between Europe and the Americas, leading to the Columbian "
-    "Exchange, which introduced crops like potatoes, tomatoes, and maize to the Old "
-    "World while bringing horses, cattle, and wheat to the New World. The development "
-    "of accurate nautical charts, the astrolabe, and later the chronometer enabled "
-    "increasingly precise navigation. Steam-powered vessels gradually replaced sailing "
-    "ships during the Industrial Revolution, drastically reducing voyage times and "
-    "enabling more reliable freight and passenger transport. The opening of the Suez "
-    "Canal in 1869 and the Panama Canal in 1914 further transformed global trade "
-    "routes. Today, maritime shipping accounts for approximately ninety percent of "
-    "world trade by volume, with container shipping revolutionizing cargo transport "
-    "since the 1950s. Modern port facilities handle millions of containers each year "
-    "and serve as critical nodes in the global supply chain network."
+    "Sourdough bread baking has experienced a remarkable revival among home bakers "
+    "over the past decade. Unlike breads leavened with commercial yeast, sourdough "
+    "relies entirely on a naturally fermented starter culture containing wild yeast "
+    "strains and lactic acid bacteria. The starter must be fed with fresh flour and "
+    "water on a regular schedule to remain active and healthy. Fermentation time "
+    "typically ranges from eight to twenty-four hours depending on the ambient "
+    "temperature, the hydration level of the dough, and the maturity of the starter. "
+    "A high-hydration dough, sometimes called a wet dough, produces a more open and "
+    "irregular crumb structure with larger air pockets. Bakers use a technique known "
+    "as the stretch-and-fold method during bulk fermentation to develop the gluten "
+    "network without traditional kneading. Scoring the top surface of the shaped loaf "
+    "before it enters the oven allows controlled expansion and prevents uneven tearing. "
+    "Most experienced bakers recommend baking sourdough inside a preheated Dutch oven "
+    "or cast-iron combo cooker to trap steam during the first phase of baking, which "
+    "promotes a thin, crackly crust. The Maillard reaction between amino acids and "
+    "reducing sugars during baking gives the crust its characteristic deep brown color "
+    "and complex, nutty flavor. Extended fermentation also breaks down phytic acid in "
+    "the flour, which may improve mineral bioavailability. Many enthusiasts claim that "
+    "traditionally fermented sourdough is easier to digest than commercially yeasted "
+    "bread. The craft rewards consistent practice, careful observation, and patience."
 )
-
-# Cross-attention question: cannot be answered from Doc A or Doc B alone.
-#   Doc A → Alice Chen invented AlphaCache, which revolutionized distributed KV storage
-#   Doc B → technical lead of Project Athena is Dr. Alice Chen; AlphaCache cited
-#   Combined → AlphaCache / distributed key-value storage
-CROSS_QUESTION = (
-    "Based on the documents above, what is the name of the algorithm invented by the "
-    "technical lead of Project Athena, and what type of storage system did that "
-    "algorithm revolutionize? Provide a concise answer."
-)
-
-EXPECTED_KEYWORDS = ["AlphaCache", "alphacache", "alpha cache", "Alpha Cache"]
 
 
 # ---------------------------------------------------------------------------
-# Metric containers
+# 5 cross-attention accuracy queries
 # ---------------------------------------------------------------------------
-
 
 @dataclass
-class RunResult:
-    label: str
-    generated_text: str
-    latency_sec: float
-    input_tokens: int
-    cached_tokens: int
+class Query:
+    text: str               # question text
+    keywords: list[str]     # any one of these in the answer → correct
+    description: str        # what cross-doc chain is needed
 
-    @property
-    def kv_hit_ratio(self) -> float:
-        if self.input_tokens == 0:
-            return 0.0
-        return self.cached_tokens / self.input_tokens
 
-    @property
-    def is_accurate(self) -> bool:
-        return any(kw.lower() in self.generated_text.lower() for kw in EXPECTED_KEYWORDS)
+QUERIES = [
+    Query(
+        text=(
+            "Based only on the documents provided, how many years of professional "
+            "experience does the technical lead of Project Falcon have? "
+            "Answer with a number or written-out number only."
+        ),
+        keywords=["twelve", "12"],
+        description="Q1  B→lead=Sarah Kim  ·  A→12 years experience",
+    ),
+    Query(
+        text=(
+            "Based only on the documents provided, who invented the compression "
+            "algorithm that Project Falcon uses? Give only the person's name."
+        ),
+        keywords=["Sarah", "Kim"],
+        description="Q2  B→QuickIndex used  ·  A→Sarah Kim invented QuickIndex",
+    ),
+    Query(
+        text=(
+            "Based only on the documents provided, in what year did the technical "
+            "lead of Project Falcon join TechNova? Answer with a four-digit year."
+        ),
+        keywords=["2019"],
+        description="Q3  B→lead=Sarah Kim  ·  A→joined TechNova in 2019",
+    ),
+    Query(
+        text=(
+            "Based only on the documents provided, how many engineers does the "
+            "technical lead of Project Falcon currently manage? "
+            "Answer with a number or written-out number only."
+        ),
+        keywords=["eight", "8"],
+        description="Q4  B→lead=Sarah Kim  ·  A→manages 8 engineers",
+    ),
+    Query(
+        text=(
+            "Based only on the documents provided, what languages does the technical "
+            "lead of Project Falcon speak? List them."
+        ),
+        keywords=["Korean"],
+        description="Q5  B→lead=Sarah Kim  ·  A→speaks Korean and English",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
-# Environment setup
+# Helpers
 # ---------------------------------------------------------------------------
 
-
-def setup_env(use_disk: bool, blend_special_str: str, chunk_size: int) -> None:
+def setup_environment_variables(
+    use_disk: bool = False,
+    blend_special_str: str = " # # ",
+    chunk_size: int = 256,
+) -> None:
     os.environ["LMCACHE_CHUNK_SIZE"] = str(chunk_size)
     os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
     os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str
@@ -188,15 +236,10 @@ def setup_env(use_disk: bool, blend_special_str: str, chunk_size: int) -> None:
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "10"
 
 
-# ---------------------------------------------------------------------------
-# LLM builder
-# ---------------------------------------------------------------------------
-
-
 @contextlib.contextmanager
-def build_llm(model: str):
+def build_llm_with_lmcache(model: str):
     ktc = KVTransferConfig(kv_connector="LMCacheConnectorV1", kv_role="kv_both")
-    args = EngineArgs(
+    llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
         max_model_len=8192,
@@ -204,310 +247,233 @@ def build_llm(model: str):
         enable_prefix_caching=False,
         enforce_eager=True,
     )
-    llm = LLM(**asdict(args))
+    llm = LLM(**asdict(llm_args))
     try:
         yield llm
     finally:
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
 
-# ---------------------------------------------------------------------------
-# Token helpers
-# ---------------------------------------------------------------------------
-
-
-def encode_no_bos(tokenizer, text: str) -> list[int]:
-    """Encode text and strip the leading BOS token if present."""
-    ids = tokenizer.encode(text)
-    # Most HF tokenizers prepend BOS (id=1); drop it so we can manually
-    # position it at the very beginning of the full prompt.
-    if ids and ids[0] == tokenizer.bos_token_id:
-        ids = ids[1:]
-    return ids
-
-
 def count_full_chunk_tokens(n_tokens: int, chunk_size: int) -> int:
-    """Number of tokens covered by complete chunks."""
+    """Tokens covered by complete chunks (i.e. floor(n / chunk_size) * chunk_size)."""
     return (n_tokens // chunk_size) * chunk_size
 
 
-def build_prompt(
-    tokenizer,
-    sep_ids: list[int],
-    sys_ids: list[int],
-    doc_segments: list[list[int]],
-    question_ids: list[int],
-    eos_ids: list[int],
-) -> list[int]:
-    """
-    Construct a blended prompt:
-        sys + SEP + doc0 + SEP + doc1 + ... + SEP + question + eos
-    """
-    prompt = list(sys_ids)
-    for doc in doc_segments:
-        prompt += sep_ids + doc
-    prompt += sep_ids + question_ids + eos_ids
-    return prompt
+def get_ttft(output) -> float | None:
+    """Extract TTFT from a vLLM RequestOutput if the metrics are available."""
+    m = getattr(output, "metrics", None)
+    if m is None:
+        return None
+    t0 = getattr(m, "first_scheduled_time", None)
+    t1 = getattr(m, "first_token_time", None)
+    if t0 is not None and t1 is not None:
+        return t1 - t0
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Single generate + measure
-# ---------------------------------------------------------------------------
-
-
-def run_generate(
+def measure_generate(
     llm: LLM,
-    prompt_ids: list[int],
+    prompt: list[int],
     sampling_params: SamplingParams,
     label: str,
     cached_tokens: int,
-) -> RunResult:
-    print(f"\n{'=' * 60}")
-    print(f"  Running: {label}")
-    print(f"  Input tokens : {len(prompt_ids)}")
-    print(f"  Cached tokens: {cached_tokens}  "
-          f"(est. hit ratio: {cached_tokens / max(len(prompt_ids), 1):.1%})")
-    print(f"{'=' * 60}")
+    chunk_size: int,
+) -> None:
+    """Run a single generate call and print accuracy / latency / hit-ratio."""
+    n_input = len(prompt)
+    hit_ratio = cached_tokens / n_input if n_input > 0 else 0.0
 
-    t0 = time.perf_counter()
+    print(f"\n{'─' * 62}")
+    print(f"  {label}")
+    print(f"  input tokens : {n_input}  |  cached tokens (est.): {cached_tokens}"
+          f"  |  hit ratio: {hit_ratio:.1%}")
+    print(f"{'─' * 62}")
+
+    t_start = time.time()
     outputs = llm.generate(
-        prompts={"prompt_token_ids": prompt_ids},
+        prompts={"prompt_token_ids": prompt},
         sampling_params=sampling_params,
     )
-    latency = time.perf_counter() - t0
+    latency = time.time() - t_start
 
     generated = outputs[0].outputs[0].text if outputs else ""
-    result = RunResult(
-        label=label,
-        generated_text=generated,
-        latency_sec=latency,
-        input_tokens=len(prompt_ids),
-        cached_tokens=cached_tokens,
+    ttft = get_ttft(outputs[0]) if outputs else None
+
+    print(f"  Generated : {generated!r}")
+    print(f"  Latency   : {latency:.3f}s"
+          + (f"  |  TTFT: {ttft:.3f}s" if ttft is not None else ""))
+
+
+def run_accuracy_queries(
+    llm: LLM,
+    sys_prompt: list[int],
+    sep: list[int],
+    doc_b_ids: list[int],
+    doc_a_ids: list[int],
+    tokenizer,
+    sampling_params: SamplingParams,
+    chunk_size: int,
+) -> None:
+    """Run all 5 cross-attention accuracy queries and print a result table."""
+    cached_tokens = (
+        count_full_chunk_tokens(len(doc_b_ids), chunk_size)
+        + count_full_chunk_tokens(len(doc_a_ids), chunk_size)
     )
 
-    print(f"  Generated    : {generated!r}")
-    print(f"  Latency      : {latency:.3f}s")
-    print(f"  Accurate?    : {'YES ✓' if result.is_accurate else 'NO  ✗'}")
-    return result
+    results: list[tuple[str, bool, float, float | None]] = []
+
+    for q in QUERIES:
+        q_ids = tokenizer.encode(q.text)[1:]  # strip BOS
+        prompt = (
+            sys_prompt
+            + sep + doc_b_ids
+            + sep + doc_a_ids
+            + sep + q_ids
+            + INST_CLOSE
+        )
+        n_input = len(prompt)
+        hit_ratio = cached_tokens / n_input if n_input > 0 else 0.0
+
+        print(f"\n  ▷ {q.description}")
+        t_start = time.time()
+        outputs = llm.generate(
+            prompts={"prompt_token_ids": prompt},
+            sampling_params=sampling_params,
+        )
+        latency = time.time() - t_start
+
+        generated = outputs[0].outputs[0].text if outputs else ""
+        ttft = get_ttft(outputs[0]) if outputs else None
+
+        is_correct = any(kw.lower() in generated.lower() for kw in q.keywords)
+        results.append((q.description, is_correct, latency, ttft))
+
+        correct_mark = "✓" if is_correct else "✗"
+        ttft_str = f"  TTFT {ttft:.3f}s" if ttft is not None else ""
+        print(f"    [{correct_mark}] {generated!r}")
+        print(f"        latency {latency:.3f}s{ttft_str}  |  "
+              f"hit ratio {hit_ratio:.1%}  (cached {cached_tokens}/{n_input} tokens)")
+
+        time.sleep(0.5)
+
+    # Per-query summary table
+    print(f"\n{'═' * 70}")
+    print("  ACCURACY SUMMARY  (CacheBlend: B → A order, warm cache)")
+    print(f"{'═' * 70}")
+    for desc, ok, lat, ttft in results:
+        ttft_str = f"  TTFT {ttft:.3f}s" if ttft is not None else ""
+        print(f"  {'✓' if ok else '✗'}  {desc:<50}  {lat:.2f}s{ttft_str}")
+    n_correct = sum(1 for _, ok, _, _ in results if ok)
+    print(f"{'─' * 70}")
+    print(f"  Accuracy: {n_correct}/{len(results)}")
+    print(f"{'═' * 70}\n")
 
 
 # ---------------------------------------------------------------------------
-# Main benchmark
+# Main
 # ---------------------------------------------------------------------------
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="CacheBlend accuracy / latency / KV-cache hit ratio benchmark"
+    )
+    parser.add_argument(
+        "--model", default="mistralai/Mistral-7B-Instruct-v0.2",
+        help="HuggingFace model name or local path"
+    )
+    parser.add_argument(
+        "-d", "--use-disk", action="store_true",
+        help="Use local disk backend instead of CPU memory"
+    )
+    parser.add_argument(
+        "-b", "--blend-special-str", default=" # # ",
+        help="Chunk separator string (default: ' # # ')"
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=256,
+        help="LMCache chunk size in tokens (default: 256)"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=32,
+        help="Max tokens to generate per query (default: 32)"
+    )
+    args = parser.parse_args()
 
-def benchmark(args) -> None:
-    setup_env(args.use_disk, args.blend_special_str, args.chunk_size)
+    setup_environment_variables(args.use_disk, args.blend_special_str, args.chunk_size)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # Encode the separator (strip BOS)
-    sep_ids = encode_no_bos(tokenizer, args.blend_special_str)
+    # ── Token encoding (mirrors blend.py exactly) ───────────────────────────
+    # sep: strip BOS so it slots cleanly between other segments
+    sep = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
 
-    # System prompt  (Mistral [INST] wrapper; adapt for other models via --sys-prompt)
-    if args.sys_prompt:
-        sys_ids = encode_no_bos(tokenizer, args.sys_prompt)
-        eos_ids = []
-    else:
-        # Mistral-style: BOS [INST] text [/INST]
-        sys_ids = [tokenizer.bos_token_id] + encode_no_bos(
-            tokenizer,
-            "[INST] You are a precise question-answering assistant. "
-            "Read the provided documents carefully and answer only from their content. "
-            "[/INST]",
-        )
-        eos_ids = []
+    # sys_prompt: INST_OPEN already carries the BOS (token 1); system text
+    # uses [1:] to avoid a second BOS in the middle of the sequence
+    sys_prompt = INST_OPEN + tokenizer.encode(
+        "You are a precise question-answering assistant. "
+        "Read the documents carefully and answer using only the information they contain."
+    )[1:]
 
-    # Encode each document
-    doc_a_ids = encode_no_bos(tokenizer, DOC_A)
-    doc_b_ids = encode_no_bos(tokenizer, DOC_B)
-    doc_c_ids = encode_no_bos(tokenizer, DOC_C)
-    question_ids = encode_no_bos(tokenizer, CROSS_QUESTION)
+    # Documents: strip BOS from each
+    doc_a_ids = tokenizer.encode(DOC_A)[1:]
+    doc_b_ids = tokenizer.encode(DOC_B)[1:]
+    doc_c_ids = tokenizer.encode(DOC_C)[1:]
 
-    # Report document token counts
-    print("\n── Document token counts ────────────────────────────────────")
+    # Print token counts so the user can verify chunk coverage
+    print("\n── Document token counts ─────────────────────────────────────────")
     for name, ids in [("Doc A", doc_a_ids), ("Doc B", doc_b_ids), ("Doc C", doc_c_ids)]:
         full = count_full_chunk_tokens(len(ids), args.chunk_size)
-        print(f"  {name}: {len(ids)} tokens  ({full} in full chunks of {args.chunk_size})")
-    print(f"  Question  : {len(question_ids)} tokens")
+        print(f"  {name}: {len(ids):4d} tokens  ({full} covered by full chunks "
+              f"of {args.chunk_size})")
     print()
 
-    sampling = SamplingParams(temperature=0, top_p=1.0, max_tokens=args.max_tokens)
-    results: list[RunResult] = []
+    sampling = SamplingParams(temperature=0, top_p=0.95, max_tokens=args.max_tokens)
 
-    with build_llm(args.model) as llm:
-        # ------------------------------------------------------------------
-        # Warmup (not measured)
-        # ------------------------------------------------------------------
-        warmup_ids = encode_no_bos(tokenizer, "Hello, how are you? " * 50)
-        print("── Warmup ───────────────────────────────────────────────────")
+    with build_llm_with_lmcache(args.model) as llm:
+
+        # ── Warmup ─────────────────────────────────────────────────────────
+        warmup_prompt = tokenizer.encode("Nice to meet you. " * 200)[1:]
+        print("── Warmup ────────────────────────────────────────────────────────")
         llm.generate(
-            prompts={"prompt_token_ids": warmup_ids},
+            prompts={"prompt_token_ids": warmup_prompt},
             sampling_params=SamplingParams(temperature=0, max_tokens=1),
         )
-        print("  Warmup done.\n")
+        print("  done.\n")
 
-        # ------------------------------------------------------------------
-        # Phase 1: Pre-computation (store)
-        #
-        # Order: Doc A → Doc B → Doc C
-        # This populates the LMCache store with KV tensors for each doc.
-        # No tokens are in cache yet → hit ratio = 0.
-        # ------------------------------------------------------------------
-        store_prompt = build_prompt(
-            tokenizer, sep_ids, sys_ids,
-            [doc_a_ids, doc_b_ids, doc_c_ids],
-            question_ids, eos_ids,
+        # ── Phase 1: Store  (A → B → C) ────────────────────────────────────
+        # Run all three docs in order so LMCache stores a KV chunk for each.
+        # No tokens in cache yet → hit ratio = 0 %.
+        store_prompt = (
+            sys_prompt
+            + sep + doc_a_ids
+            + sep + doc_b_ids
+            + sep + doc_c_ids
+            + sep + tokenizer.encode("Briefly list the topics covered.")[1:]
+            + INST_CLOSE
         )
-        # First call: cold cache → 0 cached tokens
-        r_store = run_generate(
+        measure_generate(
             llm, store_prompt, sampling,
-            label="Phase 1 – Store (A→B→C, cold cache, baseline accuracy)",
+            label="Phase 1 – Store (A → B → C, cold cache)",
             cached_tokens=0,
+            chunk_size=args.chunk_size,
         )
-        results.append(r_store)
         time.sleep(1)
 
-        # ------------------------------------------------------------------
-        # Phase 2a: CacheBlend with reordered docs (Doc B first, then Doc A)
-        #
-        # The order differs from Phase 1, so vLLM prefix caching cannot help.
-        # LMCache detects that doc_b and doc_a chunks are cached and blends
-        # their KV tensors to avoid full recomputation.
-        #
-        # Estimated cached tokens = full chunks from doc_a + full chunks from doc_b
-        # (doc_c is not included in this prompt, so its cached KV is unused here)
-        # ------------------------------------------------------------------
-        blend_prompt = build_prompt(
-            tokenizer, sep_ids, sys_ids,
-            [doc_b_ids, doc_a_ids],          # reversed: B first, then A
-            question_ids, eos_ids,
+        # ── Phase 2: Blend  (B → A, 5 cross-attention queries) ─────────────
+        # Document order is swapped vs. Phase 1.  Prefix caching cannot reuse
+        # anything; LMCache blends the per-chunk KVs stored in Phase 1.
+        print("\n\n── Phase 2 – CacheBlend accuracy test (B → A order) ─────────────")
+        run_accuracy_queries(
+            llm=llm,
+            sys_prompt=sys_prompt,
+            sep=sep,
+            doc_b_ids=doc_b_ids,
+            doc_a_ids=doc_a_ids,
+            tokenizer=tokenizer,
+            sampling_params=sampling,
+            chunk_size=args.chunk_size,
         )
-        cached_ba = (
-            count_full_chunk_tokens(len(doc_b_ids), args.chunk_size)
-            + count_full_chunk_tokens(len(doc_a_ids), args.chunk_size)
-        )
-        r_blend_ba = run_generate(
-            llm, blend_prompt, sampling,
-            label="Phase 2a – CacheBlend (B→A reordered, warm cache)",
-            cached_tokens=cached_ba,
-        )
-        results.append(r_blend_ba)
-        time.sleep(1)
-
-        # ------------------------------------------------------------------
-        # Phase 2b: CacheBlend repeated (same prompt) – cache fully warm
-        #
-        # The blended KV from Phase 2a may be stored; this call exercises
-        # the fully-warm path.
-        # ------------------------------------------------------------------
-        r_blend_ba2 = run_generate(
-            llm, blend_prompt, sampling,
-            label="Phase 2b – CacheBlend (B→A repeat, fully warm cache)",
-            cached_tokens=cached_ba,
-        )
-        results.append(r_blend_ba2)
-        time.sleep(1)
-
-        # ------------------------------------------------------------------
-        # Phase 3: CacheBlend with Doc B + Doc C (different subset)
-        #
-        # Doc C contains maritime history – no information about AlphaCache.
-        # This run tests that CacheBlend does NOT fabricate a correct answer
-        # when the required information (Doc A) is absent from the prompt.
-        # Expected: answer should NOT contain AlphaCache keywords.
-        # ------------------------------------------------------------------
-        blend_bc_prompt = build_prompt(
-            tokenizer, sep_ids, sys_ids,
-            [doc_b_ids, doc_c_ids],
-            question_ids, eos_ids,
-        )
-        cached_bc = (
-            count_full_chunk_tokens(len(doc_b_ids), args.chunk_size)
-            + count_full_chunk_tokens(len(doc_c_ids), args.chunk_size)
-        )
-        r_blend_bc = run_generate(
-            llm, blend_bc_prompt, sampling,
-            label="Phase 3 – CacheBlend (B→C, Doc A absent – expect no AlphaCache)",
-            cached_tokens=cached_bc,
-        )
-        results.append(r_blend_bc)
-
-    # ------------------------------------------------------------------
-    # Summary report
-    # ------------------------------------------------------------------
-    print("\n\n" + "═" * 70)
-    print("  CACHEBLEND BENCHMARK SUMMARY")
-    print("═" * 70)
-    print(f"  {'Run':<50} {'Latency':>8}  {'Hit%':>6}  {'Accurate':>8}")
-    print(f"  {'-'*50} {'-'*8}  {'-'*6}  {'-'*8}")
-    for r in results:
-        print(
-            f"  {r.label:<50} {r.latency_sec:>7.2f}s"
-            f"  {r.kv_hit_ratio:>5.1%}  {'YES ✓' if r.is_accurate else 'NO  ✗':>8}"
-        )
-    print("═" * 70)
-
-    # Latency speedup (Phase 2a vs Phase 1)
-    if len(results) >= 2 and results[0].latency_sec > 0:
-        speedup = results[0].latency_sec / results[1].latency_sec
-        print(f"\n  Speedup  (Phase 2a vs Phase 1): {speedup:.2f}×")
-
-    # Accuracy check
-    print()
-    correct = sum(1 for r in results[:3] if r.is_accurate)
-    print(f"  Accuracy (Phases 1-2b, expected correct): {correct}/3 runs correct")
-    print(
-        f"  Phase 3 (Doc A absent):  "
-        f"{'correct – model did not hallucinate' if not results[3].is_accurate else 'WARNING – hallucinated AlphaCache'}"
-        if len(results) >= 4 else ""
-    )
-    print()
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="CacheBlend accuracy / latency / hit-ratio benchmark"
-    )
-    parser.add_argument(
-        "--model",
-        default="mistralai/Mistral-7B-Instruct-v0.2",
-        help="HuggingFace model name or local path",
-    )
-    parser.add_argument(
-        "--use-disk",
-        action="store_true",
-        help="Use local disk as the LMCache backend instead of CPU memory",
-    )
-    parser.add_argument(
-        "--blend-special-str",
-        default=" # # ",
-        help="Separator string used to delimit document chunks (default: ' # # ')",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=256,
-        help="LMCache chunk size in tokens (default: 256)",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=64,
-        help="Maximum tokens to generate per query (default: 64)",
-    )
-    parser.add_argument(
-        "--sys-prompt",
-        default="",
-        help="Custom system prompt (default: Mistral [INST] format)",
-    )
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    benchmark(parse_args())
+    main()
