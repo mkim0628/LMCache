@@ -1363,6 +1363,5 @@ flowchart TB
   (`StorageManager._get_allocator_backend`).
 - 15-b 의 ref-count 전이는 코드 분기를 읽고 재구성한 **해석**이며,
   명시적 FSM 구현이 아니다. 15-a 도 docstring 에 없는 전이는 같은 방식으로 해석했다.
-  (아래 중복 문장 제거용)
 - 정확한 ref 값(예: 중복 put 시 skip)은 `local_cpu_backend.py` 를 확인할 것.
 - MP 서버 §8 의 `EngineModule` / `InstanceLivenessTarget` 은 `lmcache/v1/multiprocess/engine_module.py` 에서 `typing.Protocol` 임을 확인했다.
